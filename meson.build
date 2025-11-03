@@ -1,6 +1,6 @@
-# project('pexw', 'c',
-#     version: '2.0',
-#     default_options: ['c_std=c11'])
+project('pexw', 'c',
+    version: '2.0',
+    default_options: ['c_std=c11'])
 
 executable('pexw', ['pexw.c'])
 
@@ -20,3 +20,4 @@ else
   warning('Capstone not found. Skipping pexw_cross build.')
   message('Install with: apt-get install libcapstone-dev (Linux) or brew install capstone (macOS)')
 endif
+
