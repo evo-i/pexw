@@ -69,7 +69,17 @@ jobs:
     - name: Build
       run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }}
 
-    - name: List build artifacts
+    - name: List build artifacts (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        Write-Host "Listing: $env:BUILD_DIR"
+        $env:BUILD_DIR = "${{ steps.strings.outputs.build-output-dir }}"
+        Get-ChildItem -Force $env:BUILD_DIR | Format-List
+
+    - name: List build artifacts (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
       run: |
         ls -la ${{ steps.strings.outputs.build-output-dir }}
 
