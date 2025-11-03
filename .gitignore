@@ -1,0 +1,40 @@
+# Build directories
+build/
+Build/
+cmake-build-*/
+
+# Compiled binaries
+*.exe
+*.out
+pexw
+pexw_cross
+
+# Object files and libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# vcpkg
+vcpkg/
+vcpkg_installed/
