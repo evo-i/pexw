@@ -42,8 +42,8 @@ jobs:
       id: strings
       shell: bash
       run: |
-        echo "build-output-dir=${{ github.workspace }}/utils/build" >> "$GITHUB_OUTPUT"
-        echo "source-dir=${{ github.workspace }}/utils" >> "$GITHUB_OUTPUT"
+        echo "build-output-dir=${{ github.workspace }}/build" >> "$GITHUB_OUTPUT"
+        echo "source-dir=${{ github.workspace }}" >> "$GITHUB_OUTPUT"
 
     - name: Install dependencies (Ubuntu)
       if: matrix.os == 'ubuntu-latest'
