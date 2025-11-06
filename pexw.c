@@ -501,20 +501,63 @@ static int cmp_entries_by_rva(const void *pa, const void *pb) {
   return 0;
 }
 
+static int cmp_entries_by_data_number(const void *pa, const void *pb) {
+  const data_entry_t *a = pa;
+  const data_entry_t *b = pb;
+  
+  // Extract numbers from "dataXX" format
+  int num_a = -1, num_b = -1;
+  
+  if (strncmp(a->data_name, "data", 4) == 0) {
+    num_a = atoi(a->data_name + 4);
+  }
+  
+  if (strncmp(b->data_name, "data", 4) == 0) {
+    num_b = atoi(b->data_name + 4);
+  }
+  
+  // If both have valid numbers, sort by number
+  if (num_a >= 0 && num_b >= 0) {
+    return num_a - num_b;
+  }
+  
+  // If only one has valid number, it comes first
+  if (num_a >= 0) return -1;
+  if (num_b >= 0) return 1;
+  
+  // If neither has valid number, sort by string
+  return strcmp(a->data_name, b->data_name);
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) {
-    fprintf(stderr, "Usage: %s <PEfile> [threads]\n", argv[0]);
+    fprintf(stderr, "Usage: %s <PEfile> [threads] [--no-sort]\n", argv[0]);
+    fprintf(stderr, "  <PEfile>    - Path to PE file (DLL/EXE)\n");
+    fprintf(stderr, "  [threads]   - Number of threads (default: CPU count)\n");
+    fprintf(stderr, "  [--no-sort] - Disable sorting by data number (keep RVA order)\n");
     return 1;
   }
+
+  bool no_sort = false;
   int32_t nthreads = 0;
-  if (argc >= 3) {
-    nthreads = atoi(argv[2]);
+  const char *fname = argv[1];
+
+  // Parse arguments
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "--no-sort") == 0) {
+      no_sort = true;
+    } else {
+      // Try to parse as thread count
+      int threads_arg = atoi(argv[i]);
+      if (threads_arg > 0) {
+        nthreads = threads_arg;
+      }
+    }
   }
+
   if (nthreads <= 0) {
     nthreads = get_cpu_count();
   }
-
-  const char *fname = argv[1];
   struct stat st;
   if (stat(fname, &st) != 0) {
     perror("stat");
@@ -649,6 +692,11 @@ int main(int argc, char **argv) {
 
   double elapsed = timer_get_elapsed(&timer);
   fprintf(stderr, "Elapsed: %.4f s (threads=%" PRId32 ")\n", elapsed, nthreads);
+
+  // Sort by data number for output (unless --no-sort is specified)
+  if (data_entry_count > 1 && !no_sort) {
+    qsort(data_entries, data_entry_count, sizeof(data_entry_t), cmp_entries_by_data_number);
+  }
 
   for (size_t i = 0; i < data_entry_count; i++) {
     if (data_entries[i].found) {
