@@ -1,813 +1,716 @@
-#include <windows.h>
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <stdbool.h>
+#include <threads.h>
+#include <sys/stat.h>
+
+#if defined(_WIN32) || defined(_WIN64)
+  #include <windows.h>
+
+  #define ATOMIC_VAR_INIT(x) {x}
+
+  typedef struct { volatile uint64_t val; } atomic_uint_fast64_t;
+
+  static inline uint64_t atomic_load(atomic_uint_fast64_t *obj) {
+    return InterlockedOr64((volatile LONG64*)&obj->val, 0);
+  }
+
+  static inline bool atomic_compare_exchange_strong(atomic_uint_fast64_t *obj, uint64_t *expected, uint64_t desired) {
+    uint64_t old = InterlockedCompareExchange64((volatile LONG64*)&obj->val, desired, *expected);
+    if (old == *expected) return true;
+    *expected = old;
+    return false;
+  }
+
+  typedef struct {
+    LARGE_INTEGER start;
+    LARGE_INTEGER freq;
+  } timer_t;
+
+  static inline void timer_init(timer_t *t) {
+    QueryPerformanceFrequency(&t->freq);
+    QueryPerformanceCounter(&t->start);
+  }
+
+  static inline double timer_elapsed(timer_t *t) {
+    LARGE_INTEGER end;
+    QueryPerformanceCounter(&end);
+    return (double)(end.QuadPart - t->start.QuadPart) / (double)t->freq.QuadPart;
+  }
+
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+  #include <sys/types.h>
+  #include <sys/sysctl.h>
+  #include <stdatomic.h>
+  #include <time.h>
+
+  typedef struct {
+    struct timespec start;
+  } timer_t;
+
+  static inline void timer_init(timer_t *t) {
+    clock_gettime(CLOCK_MONOTONIC, &t->start);
+  }
+
+  static inline double timer_elapsed(timer_t *t) {
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    return (end.tv_sec - t->start.tv_sec) + (end.tv_nsec - t->start.tv_nsec) / 1e9;
+  }
+#else
+  #include <unistd.h>
+  #include <stdatomic.h>
+  #include <time.h>
+
+  typedef struct {
+    struct timespec start;
+  } timer_t;
+
+  static inline void timer_init(timer_t *t) {
+    clock_gettime(CLOCK_MONOTONIC, &t->start);
+  }
+
+  static inline double timer_elapsed(timer_t *t) {
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    return (end.tv_sec - t->start.tv_sec) + (end.tv_nsec - t->start.tv_nsec) / 1e9;
+  }
+
+#endif
+
+#define DOS_SIGNATURE       0x5A4D
+#define PE_SIGNATURE        0x00004550
+#define OPT_MAGIC64         0x20B
+#define MACHINE_AMD64       0x8664
+#define XOR_KEY             0x05
+
+#define MAX_MARKER_NAME_LEN 32
+#define MAX_STRING_LEN      512
+#define MAX_STRINGS_ARRAY   128
+#define INITIAL_ARRAY_CAP   128
+#define SCAN_DEPTH          2000
+#define LEA_INSTR_SIZE      7
+#define FUNC_MIN_SIZE       16
+#define MIN_MARKERS_COUNT   15
+#define MARGIN_BYTES        8
+#define DATA_DIR_COUNT      16
+#define SECTION_NAME_LEN    8
+#define DEFAULT_CPU_COUNT   4
+
+#define OPCODE_SUB_RSP_38_0 0x48
+#define OPCODE_SUB_RSP_38_1 0x83
+#define OPCODE_SUB_RSP_38_2 0xEC
+#define OPCODE_SUB_RSP_38_3 0x38
+#define OPCODE_LEA_RDX_0    0x48
+#define OPCODE_LEA_RDX_1    0x8D
+#define OPCODE_LEA_RDX_2    0x15
+#define OPCODE_RET          0xC3
+
+#define MARKER_SIGNATURE    0x61746164
+#define MARKER_PREFIX_LEN   4
+#define MARGIN_CHECK_BYTES  6
+#define DISP_OFFSET         3
+#define LEA_FULL_SIZE       7
+#define DIGIT_MIN           0x30
+#define DIGIT_MAX           0x39
 
 #pragma pack(push, 1)
 
 typedef struct {
-  WORD  e_magic;
-  WORD  e_cblp;
-  WORD  e_cp;
-  WORD  e_crlc;
-  WORD  e_cparhdr;
-  WORD  e_minalloc;
-  WORD  e_maxalloc;
-  WORD  e_ss;
-  WORD  e_sp;
-  WORD  e_csum;
-  WORD  e_ip;
-  WORD  e_cs;
-  WORD  e_lfarlc;
-  WORD  e_ovno;
-  WORD  e_res[4];
-  WORD  e_oemid;
-  WORD  e_oeminfo;
-  WORD  e_res2[10];
-  DWORD e_lfanew;
-} DOS_HEADER;
+  uint16_t e_magic;
+  uint16_t e_cblp;
+  uint16_t e_cp;
+  uint16_t e_crlc;
+  uint16_t e_cparhdr;
+  uint16_t e_minalloc;
+  uint16_t e_maxalloc;
+  uint16_t e_ss;
+  uint16_t e_sp;
+  uint16_t e_csum;
+  uint16_t e_ip;
+  uint16_t e_cs;
+  uint16_t e_lfarlc;
+  uint16_t e_ovno;
+  uint16_t e_res[4];
+  uint16_t e_oemid;
+  uint16_t e_oeminfo;
+  uint16_t e_res2[10];
+  uint32_t e_lfanew;
+} dos_header_t;
 
 typedef struct {
-  WORD  Machine;
-  WORD  NumberOfSections;
-  DWORD TimeDateStamp;
-  DWORD PointerToSymbolTable;
-  DWORD NumberOfSymbols;
-  WORD  SizeOfOptionalHeader;
-  WORD  Characteristics;
-} FILE_HEADER;
+  uint16_t machine;
+  uint16_t number_of_sections;
+  uint32_t time_date_stamp;
+  uint32_t pointer_to_symbol_table;
+  uint32_t number_of_symbols;
+  uint16_t size_of_optional_header;
+  uint16_t characteristics;
+} file_header_t;
 
 typedef struct {
-  DWORD VirtualAddress;
-  DWORD Size;
-} DATA_DIRECTORY;
-
-#define NUM_DATA_DIRECTORIES 16
+  uint32_t virtual_address;
+  uint32_t size;
+} data_directory_entry_t;
 
 typedef struct {
-  WORD           Magic;
-  BYTE           MajorLinkerVersion;
-  BYTE           MinorLinkerVersion;
-  DWORD          SizeOfCode;
-  DWORD          SizeOfInitializedData;
-  DWORD          SizeOfUninitializedData;
-  DWORD          AddressOfEntryPoint;
-  DWORD          BaseOfCode;
-  UINT64         ImageBase;
-  DWORD          SectionAlignment;
-  DWORD          FileAlignment;
-  WORD           MajorOperatingSystemVersion;
-  WORD           MinorOperatingSystemVersion;
-  WORD           MajorImageVersion;
-  WORD           MinorImageVersion;
-  WORD           MajorSubsystemVersion;
-  WORD           MinorSubsystemVersion;
-  DWORD          Win32VersionValue;
-  DWORD          SizeOfImage;
-  DWORD          SizeOfHeaders;
-  DWORD          CheckSum;
-  WORD           Subsystem;
-  WORD           DllCharacteristics;
-  UINT64         SizeOfStackReserve;
-  UINT64         SizeOfStackCommit;
-  UINT64         SizeOfHeapReserve;
-  UINT64         SizeOfHeapCommit;
-  DWORD          LoaderFlags;
-  DWORD          NumberOfRvaAndSizes;
-  DATA_DIRECTORY DataDirectory[NUM_DATA_DIRECTORIES];
-} OPTIONAL_HEADER64;
+  uint16_t magic;
+  uint8_t major_linker_version;
+  uint8_t minor_linker_version;
+  uint32_t size_of_code;
+  uint32_t size_of_initialized_data;
+  uint32_t size_of_uninitialized_data;
+  uint32_t address_of_entry_point;
+  uint32_t base_of_code;
+  uint64_t image_base;
+  uint32_t section_alignment;
+  uint32_t file_alignment;
+  uint16_t major_operating_system_version;
+  uint16_t minor_operating_system_version;
+  uint16_t major_image_version;
+  uint16_t minor_image_version;
+  uint16_t major_subsystem_version;
+  uint16_t minor_subsystem_version;
+  uint32_t win32_version_value;
+  uint32_t size_of_image;
+  uint32_t size_of_headers;
+  uint32_t check_sum;
+  uint16_t subsystem;
+  uint16_t dll_characteristics;
+  uint64_t size_of_stack_reserve;
+  uint64_t size_of_stack_commit;
+  uint64_t size_of_heap_reserve;
+  uint64_t size_of_heap_commit;
+  uint32_t loader_flags;
+  uint32_t number_of_rva_and_sizes;
+  data_directory_entry_t data_directory[DATA_DIR_COUNT];
+} optional_header64_t;
 
 typedef struct {
-  DWORD             Signature;
-  FILE_HEADER       FileHeader;
-  OPTIONAL_HEADER64 OptionalHeader;
-} NT_HEADERS64;
+  uint32_t signature;
+  file_header_t file_header;
+  optional_header64_t optional_header;
+} nt_headers64_t;
 
 typedef struct {
-  BYTE  Name[8];
-  DWORD VirtualSize;
-  DWORD VirtualAddress;
-  DWORD SizeOfRawData;
-  DWORD PointerToRawData;
-  DWORD PointerToRelocations;
-  DWORD PointerToLinenumbers;
-  WORD  NumberOfRelocations;
-  WORD  NumberOfLinenumbers;
-  DWORD Characteristics;
-} SECTION_HEADER;
+  uint8_t name[SECTION_NAME_LEN];
+  uint32_t virtual_size;
+  uint32_t virtual_address;
+  uint32_t size_of_raw_data;
+  uint32_t pointer_to_raw_data;
+  uint32_t pointer_to_relocations;
+  uint32_t pointer_to_linenumbers;
+  uint16_t number_of_relocations;
+  uint16_t number_of_linenumbers;
+  uint32_t characteristics;
+} section_header_t;
 
 #pragma pack(pop)
 
-#define DOS_SIGNATURE 0x5A4D
-#define NT_SIGNATURE 0x00004550
-#define OPT_HDR64_MAGIC 0x20B
-#define MACHINE_AMD64 0x8664
-
 typedef struct {
-  char   name[9];
-  UINT64 virtualAddress;
-  UINT64 virtualSize;
-  UINT64 rawAddress;
-  DWORD  rawSize;
-  BYTE*  data;
-} Section;
+  char data_name[MAX_MARKER_NAME_LEN];
+  char decrypted_string[MAX_STRING_LEN];
+  uint64_t rdata_rva;
+  uint64_t string_rva;
+  bool found;
+} data_entry_t;
 
-typedef struct {
-  char   dataName[32];
-  char   encryptedString[512];
-  char   decryptedString[512];
-  UINT64 rdataRVA;
-  UINT64 stringRVA;
-  int    found;
-} DataEntry;
+static uint8_t *pe_data = NULL;
+static size_t pe_size = 0;
+static section_header_t *sections = NULL;
+static int32_t num_sections = 0;
+static uint64_t image_base = 0;
+static section_header_t *text_sec = NULL;
+static section_header_t *rdata_sec = NULL;
 
-typedef struct {
-  HANDLE hFile;
-  HANDLE hMapping;
-  BYTE*  pView;
-  DWORD  fileSize;
-} MappedFile;
+static data_entry_t *data_entries = NULL;
+static size_t data_entry_count = 0;
+static size_t data_entry_cap = 0;
+static mtx_t entries_mtx;
 
-Section    textSection       = {0};
-Section    rdataSection      = {0};
-UINT64     imageBase         = 0;
-DataEntry* dataEntries       = NULL;
-int        dataEntryCount    = 0;
-int        dataEntryCapacity = 0;
-HANDLE     hConsole          = NULL;
+static atomic_uint_fast64_t marker_function_rva_atomic = ATOMIC_VAR_INIT(0);
 
-void
-myMemSet(void* dest, int val, SIZE_T count) {
-  BYTE* p = (BYTE*)dest;
-  for (SIZE_T i = 0; i < count; i++) {
-    p[i] = (BYTE)val;
+static int32_t get_cpu_count(void) {
+#if defined(_WIN32) || defined(_WIN64)
+  SYSTEM_INFO sysinfo;
+  GetSystemInfo(&sysinfo);
+  return (int32_t) sysinfo.dwNumberOfProcessors;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+  int32_t count;
+  size_t count_len = sizeof(count);
+  if (sysctlbyname("hw.ncpu", &count, &count_len, NULL, 0) == 0) {
+    return count;
+  }
+  return DEFAULT_CPU_COUNT;
+#elif defined(_SC_NPROCESSORS_ONLN)
+  long procs = sysconf(_SC_NPROCESSORS_ONLN);
+  return (procs > 0) ? (int32_t) procs : DEFAULT_CPU_COUNT;
+#else
+  return DEFAULT_CPU_COUNT;
+#endif
+}
+
+static void xor_decrypt_inplace(char *s, char byte) {
+  for (size_t i = 0; s[i]; ++i) {
+    s[i] = (char)(s[i] ^ byte);
   }
 }
 
-void
-myMemCpy(void* dest, const void* src, SIZE_T count) {
-  BYTE*       d = (BYTE*)dest;
-  const BYTE* s = (const BYTE*)src;
-  for (SIZE_T i = 0; i < count; i++) {
-    d[i] = s[i];
-  }
-}
-
-int
-myStrLen(const char* str) {
-  int len = 0;
-  while (str[len] != '\0')
-    len++;
-  return len;
-}
-
-void
-myStrCpy(char* dest, const char* src, int maxLen) {
-  int i = 0;
-  while (i < maxLen - 1 && src[i] != '\0') {
-    dest[i] = src[i];
-    i++;
-  }
-  dest[i] = '\0';
-}
-
-int
-myStrCmp(const char* s1, const char* s2) {
-  while (*s1 && (*s1 == *s2)) {
-    s1++;
-    s2++;
-  }
-  return *(unsigned char*)s1 - *(unsigned char*)s2;
-}
-
-void
-myPrint(const char* str) {
-  DWORD written;
-  WriteConsoleA(hConsole, str, myStrLen(str), &written, NULL);
-}
-
-void
-myPrintNum(UINT64 num, int isHex) {
-  char buffer[32];
-  int  i = 0;
-
-  if (num == 0) {
-    buffer[i++] = '0';
-  } else {
-    char temp[32];
-    int  j = 0;
-
-    while (num > 0) {
-      int digit = num % (isHex ? 16 : 10);
-      temp[j++] = (digit < 10) ? ('0' + digit) : ('A' + digit - 10);
-      num /= (isHex ? 16 : 10);
-    }
-
-    while (j > 0) {
-      buffer[i++] = temp[--j];
-    }
-  }
-
-  buffer[i] = '\0';
-  myPrint(buffer);
-}
-
-void
-decryptString(const char* encrypted, char* decrypted, int maxLen) {
-  int len = myStrLen(encrypted);
-  if (len > maxLen)
-    len = maxLen;
-
-  for (int i = 0; i < len; i++) {
-    decrypted[i] = encrypted[i] ^ 0x05;
-  }
-  decrypted[len] = '\0';
-}
-
-void
-addDataEntry(const char* name, UINT64 rdataRVA) {
-  if (dataEntryCount >= dataEntryCapacity) {
-    dataEntryCapacity     = dataEntryCapacity == 0 ? 100 : dataEntryCapacity * 2;
-    DataEntry* newEntries = (DataEntry*)HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, dataEntries,
-                                                    dataEntryCapacity * sizeof(DataEntry));
-    if (!newEntries) {
-      if (!dataEntries) {
-        dataEntries = (DataEntry*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-                                            dataEntryCapacity * sizeof(DataEntry));
+static void add_data_entry_ts(const char *name, uint64_t rdata_rva) {
+  mtx_lock(&entries_mtx);
+  {
+    if (data_entry_count >= data_entry_cap) {
+      size_t newcap = data_entry_cap == 0 ? INITIAL_ARRAY_CAP : data_entry_cap * 2;
+      data_entry_t *p = realloc(data_entries, newcap * sizeof(data_entry_t));
+      if (!p) {
+        perror("realloc");
+        exit(1);
       }
-    } else {
-      dataEntries = newEntries;
+      data_entries = p;
+      data_entry_cap = newcap;
     }
+    data_entry_t *e = &data_entries[data_entry_count++];
+    memset(e, 0, sizeof(data_entry_t));
+    size_t name_len = strlen(name);
+    if (name_len >= MAX_MARKER_NAME_LEN) {
+      name_len = MAX_MARKER_NAME_LEN - 1;
+    }
+    memcpy(e->data_name, name, name_len);
+    e->data_name[name_len] = '\0';
+    e->rdata_rva = rdata_rva;
+    e->found = false;
   }
-
-  myMemSet(&dataEntries[dataEntryCount], 0, sizeof(DataEntry));
-  myStrCpy(dataEntries[dataEntryCount].dataName, name, 31);
-  dataEntries[dataEntryCount].rdataRVA = rdataRVA;
-  dataEntries[dataEntryCount].found    = 0;
-  dataEntryCount++;
+  mtx_unlock(&entries_mtx);
 }
 
-int
-mapPEFile(const char* filename, MappedFile* mf) {
-  mf->hFile    = INVALID_HANDLE_VALUE;
-  mf->hMapping = NULL;
-  mf->pView    = NULL;
-  mf->fileSize = 0;
+typedef struct {
+  uint32_t start_off, end_off;
+} rdata_arg_t;
 
-  mf->hFile = CreateFileA(filename, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                          FILE_ATTRIBUTE_NORMAL, NULL);
-  if (mf->hFile == INVALID_HANDLE_VALUE) {
-    myPrint("Error: Cannot open file\r\n");
-    return 0;
+typedef struct {
+  uint32_t start_off, end_off;
+} text_arg_t;
+
+typedef struct {
+  uint32_t start_off, end_off;
+  size_t mapped;
+} string_arg_t;
+
+static int rdata_worker(void *arg) {
+  rdata_arg_t a = *(rdata_arg_t*)arg;
+  uint32_t *base = (uint32_t*)(pe_data + rdata_sec->pointer_to_raw_data);
+  uint32_t raw_size = rdata_sec->size_of_raw_data;
+  
+  uint32_t start_word = a.start_off / 4;
+  uint32_t end_word = (a.end_off + MARGIN_BYTES) / 4;
+  uint32_t size_words = raw_size / 4;
+  
+  if (end_word > size_words) {
+    end_word = size_words;
   }
 
-  mf->fileSize = GetFileSize(mf->hFile, NULL);
-  if (mf->fileSize == INVALID_FILE_SIZE || mf->fileSize == 0) {
-    myPrint("Error: Invalid file size\r\n");
-    CloseHandle(mf->hFile);
-    return 0;
-  }
-
-  mf->hMapping = CreateFileMappingA(mf->hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-  if (mf->hMapping == NULL) {
-    myPrint("Error: Cannot create file mapping\r\n");
-    CloseHandle(mf->hFile);
-    return 0;
-  }
-
-  mf->pView = (BYTE*)MapViewOfFile(mf->hMapping, FILE_MAP_READ, 0, 0, 0);
-  if (mf->pView == NULL) {
-    myPrint("Error: Cannot map view of file\r\n");
-    CloseHandle(mf->hMapping);
-    CloseHandle(mf->hFile);
-    return 0;
-  }
-
-  return 1;
-}
-
-void
-unmapPEFile(MappedFile* mf) {
-  if (mf->pView != NULL) {
-    UnmapViewOfFile(mf->pView);
-    mf->pView = NULL;
-  }
-  if (mf->hMapping != NULL) {
-    CloseHandle(mf->hMapping);
-    mf->hMapping = NULL;
-  }
-  if (mf->hFile != INVALID_HANDLE_VALUE) {
-    CloseHandle(mf->hFile);
-    mf->hFile = INVALID_HANDLE_VALUE;
-  }
-}
-
-UINT64
-rvaToFileOffset(UINT64 rva, SECTION_HEADER* sections, int numSections) {
-  for (int i = 0; i < numSections; i++) {
-    if (rva >= sections[i].VirtualAddress &&
-        rva < sections[i].VirtualAddress + sections[i].VirtualSize) {
-      return sections[i].PointerToRawData + (rva - sections[i].VirtualAddress);
+  for (uint32_t i = start_word; i < end_word; ++i) {
+    if (base[i] == MARKER_SIGNATURE) {
+      uint8_t *ptr = (uint8_t*)&base[i];
+      if (ptr[4] >= DIGIT_MIN && ptr[4] <= DIGIT_MAX &&
+          ptr[5] >= DIGIT_MIN && ptr[5] <= DIGIT_MAX) {
+        char name[MAX_MARKER_NAME_LEN];
+        int32_t j = 0;
+        uint32_t byte_off = i * 4;
+        while (j < MAX_MARKER_NAME_LEN - 1 && byte_off + j < raw_size && 
+               pe_data[rdata_sec->pointer_to_raw_data + byte_off + j] != 0 &&
+               (j < MARKER_PREFIX_LEN || 
+                (pe_data[rdata_sec->pointer_to_raw_data + byte_off + j] >= DIGIT_MIN && 
+                 pe_data[rdata_sec->pointer_to_raw_data + byte_off + j] <= DIGIT_MAX))) {
+          name[j] = (char)pe_data[rdata_sec->pointer_to_raw_data + byte_off + j];
+          j++;
+        }
+        name[j] = 0;
+        uint64_t rva = (uint64_t)rdata_sec->virtual_address + byte_off;
+        add_data_entry_ts(name, rva);
+      }
     }
   }
   return 0;
 }
 
-int
-parsePEHeaders(BYTE* peData, DWORD fileSize, SECTION_HEADER** outSections, int* outNumSections) {
-  if (fileSize < sizeof(DOS_HEADER)) {
-    myPrint("Error: File too small\r\n");
+static int marker_worker(void *arg) {
+  text_arg_t a = *(text_arg_t*)arg;
+  uint8_t *base = pe_data + text_sec->pointer_to_raw_data;
+  uint32_t raw_size = text_sec->size_of_raw_data;
+  uint64_t rdata_start = image_base + rdata_sec->virtual_address;
+  uint64_t rdata_end = rdata_start + rdata_sec->virtual_size;
+
+  if (a.start_off >= raw_size) {
     return 0;
   }
-
-  DOS_HEADER* dosHeader = (DOS_HEADER*)peData;
-  if (dosHeader->e_magic != DOS_SIGNATURE) {
-    myPrint("Error: Invalid DOS signature\r\n");
-    return 0;
+  if (a.end_off > raw_size) {
+    a.end_off = raw_size;
   }
 
-  myPrint("[+] DOS Header: 0x");
-  myPrintNum(dosHeader->e_lfanew, 1);
-  myPrint("\r\n");
-
-  DWORD* peSignature = (DWORD*)(peData + dosHeader->e_lfanew);
-  if (*peSignature != NT_SIGNATURE) {
-    myPrint("Error: Invalid PE signature\r\n");
-    return 0;
-  }
-
-  myPrint("[+] PE Signature found\r\n");
-
-  FILE_HEADER* fileHeader = (FILE_HEADER*)(peData + dosHeader->e_lfanew + 4);
-
-  myPrint("[+] Machine: 0x");
-  myPrintNum(fileHeader->Machine, 1);
-  myPrint("\r\n[+] Sections: ");
-  myPrintNum(fileHeader->NumberOfSections, 0);
-  myPrint("\r\n");
-
-  if (fileHeader->Machine != MACHINE_AMD64) {
-    myPrint("Error: Only x64 supported\r\n");
-    return 0;
-  }
-
-  NT_HEADERS64* ntHeaders = (NT_HEADERS64*)(peData + dosHeader->e_lfanew);
-
-  if (ntHeaders->OptionalHeader.Magic != OPT_HDR64_MAGIC) {
-    myPrint("Error: Invalid Optional Header\r\n");
-    return 0;
-  }
-
-  imageBase = ntHeaders->OptionalHeader.ImageBase;
-  myPrint("[+] Image Base: 0x");
-  myPrintNum(imageBase, 1);
-  myPrint("\r\n");
-
-  *outSections =
-      (SECTION_HEADER*)((BYTE*)&ntHeaders->OptionalHeader + fileHeader->SizeOfOptionalHeader);
-  *outNumSections = fileHeader->NumberOfSections;
-
-  return 1;
-}
-
-int
-loadSections(BYTE* peData, DWORD fileSize, SECTION_HEADER* sections, int numSections) {
-  myPrint("\r\n[*] Loading sections:\r\n");
-
-  for (int i = 0; i < numSections; i++) {
-    char sectionName[9] = {0};
-    myMemCpy(sectionName, sections[i].Name, 8);
-
-    myPrint("[+] ");
-    myPrint(sectionName);
-    myPrint(" VA=0x");
-    myPrintNum(sections[i].VirtualAddress, 1);
-    myPrint(" Size=0x");
-    myPrintNum(sections[i].VirtualSize, 1);
-    myPrint("\r\n");
-
-    if (myStrCmp(sectionName, ".text") == 0) {
-      myStrCpy(textSection.name, sectionName, 8);
-      textSection.virtualAddress = sections[i].VirtualAddress;
-      textSection.virtualSize    = sections[i].VirtualSize;
-      textSection.rawAddress     = sections[i].PointerToRawData;
-      textSection.rawSize        = sections[i].SizeOfRawData;
-      textSection.data           = peData + sections[i].PointerToRawData;
+  for (uint32_t i = a.start_off; i + FUNC_MIN_SIZE < a.end_off; ++i) {
+    if (atomic_load(&marker_function_rva_atomic) != 0) {
+      break;
     }
-
-    if (myStrCmp(sectionName, ".rdata") == 0) {
-      myStrCpy(rdataSection.name, sectionName, 8);
-      rdataSection.virtualAddress = sections[i].VirtualAddress;
-      rdataSection.virtualSize    = sections[i].VirtualSize;
-      rdataSection.rawAddress     = sections[i].PointerToRawData;
-      rdataSection.rawSize        = sections[i].SizeOfRawData;
-      rdataSection.data           = peData + sections[i].PointerToRawData;
-    }
-  }
-
-  if (!textSection.data || !rdataSection.data) {
-    myPrint("Error: Required sections not found\r\n");
-    return 0;
-  }
-
-  return 1;
-}
-
-int
-findDataMarkers() {
-  myPrint("\r\n[*] Scanning for dataXX markers...\r\n");
-
-  for (DWORD i = 0; i < rdataSection.rawSize - 7; i++) {
-    BYTE* ptr = rdataSection.data + i;
-
-    if (ptr[0] == 'd' && ptr[1] == 'a' && ptr[2] == 't' && ptr[3] == 'a') {
-      if ((ptr[4] >= '0' && ptr[4] <= '9') && (ptr[5] >= '0' && ptr[5] <= '9')) {
-
-        char name[32] = {0};
-        int  j        = 0;
-        while (j < 31 && ptr[j] != '\0' && (j < 4 || (ptr[j] >= '0' && ptr[j] <= '9'))) {
-          name[j] = ptr[j];
-          j++;
-        }
-        name[j] = '\0';
-
-        UINT64 rva = rdataSection.virtualAddress + i;
-        addDataEntry(name, rva);
-
-        myPrint("[+] ");
-        myPrint(name);
-        myPrint(" at 0x");
-        myPrintNum(rva, 1);
-        myPrint("\r\n");
-      }
-    }
-  }
-
-  myPrint("[+] Total: ");
-  myPrintNum(dataEntryCount, 0);
-  myPrint("\r\n");
-  return dataEntryCount;
-}
-
-int
-extractStringsFromPairedFunctions(BYTE* peData, SECTION_HEADER* sections, int numSections) {
-  myPrint("\r\n[*] Searching for initializer functions...\r\n");
-
-  UINT64 rdataStart = imageBase + rdataSection.virtualAddress;
-  UINT64 rdataEnd   = rdataStart + rdataSection.virtualSize;
-
-  UINT64 markerFunctionRVA = 0;
-
-  for (DWORD i = 0; i < textSection.rawSize - 2000; i++) {
-    BYTE* code = textSection.data + i;
-
-    if (!(code[0] == 0x48 && code[1] == 0x83 && code[2] == 0xEC && code[3] == 0x38)) {
+    uint8_t *code = base + i;
+    if (!(code[0] == OPCODE_SUB_RSP_38_0 && code[1] == OPCODE_SUB_RSP_38_1 &&
+          code[2] == OPCODE_SUB_RSP_38_2 && code[3] == OPCODE_SUB_RSP_38_3)) {
       continue;
     }
-
-    int markerCount    = 0;
-    int nonMarkerCount = 0;
-
-    for (DWORD j = i; j < i + 2000 && j < textSection.rawSize - 7; j++) {
-      BYTE* instr = textSection.data + j;
-
-      if (instr[0] == 0x48 && instr[1] == 0x8D && instr[2] == 0x15) {
-        INT32  disp     = *(INT32*)(instr + 3);
-        UINT64 instrRVA = textSection.virtualAddress + j;
-        UINT64 targetVA = imageBase + instrRVA + 7 + disp;
-
-        if (targetVA >= rdataStart && targetVA < rdataEnd) {
-          UINT64 targetRVA = targetVA - imageBase;
-
-          int isMarker = 0;
-          for (int k = 0; k < dataEntryCount; k++) {
-            if (targetRVA == dataEntries[k].rdataRVA) {
-              isMarker = 1;
-              break;
+    size_t marker_count = 0, non_marker_count = 0;
+    for (uint32_t j = i; j < i + SCAN_DEPTH && j + LEA_INSTR_SIZE < raw_size; ++j) {
+      uint8_t *instr = base + j;
+      if (instr[0] == OPCODE_LEA_RDX_0 && instr[1] == OPCODE_LEA_RDX_1 && 
+          instr[2] == OPCODE_LEA_RDX_2) {
+        int32_t disp = *(int32_t*)(instr + DISP_OFFSET);
+        uint64_t instr_rva = (uint64_t)text_sec->virtual_address + j;
+        uint64_t target_va = image_base + instr_rva + LEA_FULL_SIZE + (uint64_t)disp;
+        if (target_va >= rdata_start && target_va < rdata_end) {
+          uint64_t target_rva = target_va - image_base;
+          bool is_marker = false;
+          mtx_lock(&entries_mtx);
+          {
+            for (size_t k = 0; k < data_entry_count; k++) {
+              if (data_entries[k].rdata_rva == target_rva) {
+                is_marker = true;
+                break;
+              }
             }
           }
-
-          if (isMarker) {
-            markerCount++;
+          mtx_unlock(&entries_mtx);
+          if (is_marker) {
+            marker_count++;
           } else {
-            nonMarkerCount++;
+            non_marker_count++;
           }
         }
       }
-
-      if (instr[0] == 0xC3)
+      if (instr[0] == OPCODE_RET) {
         break;
+      }
     }
-
-    if (markerCount >= 15 && nonMarkerCount == 0) {
-      markerFunctionRVA = textSection.virtualAddress + i;
-      myPrint("[+] Marker function at 0x");
-      myPrintNum(markerFunctionRVA, 1);
-      myPrint(" (");
-      myPrintNum(markerCount, 0);
-      myPrint(" markers)\r\n");
+    if (marker_count >= MIN_MARKERS_COUNT && non_marker_count == 0) {
+      uint64_t candidate = (uint64_t)text_sec->virtual_address + i;
+      uint64_t expected = 0;
+      atomic_compare_exchange_strong(&marker_function_rva_atomic, &expected, candidate);
       break;
     }
   }
+  return 0;
+}
 
-  if (markerFunctionRVA == 0) {
-    myPrint("[-] Marker function not found\r\n");
+static int string_worker(void *arg) {
+  string_arg_t *a = (string_arg_t*)arg;
+  uint8_t *base = pe_data + text_sec->pointer_to_raw_data;
+  uint32_t raw_size = text_sec->size_of_raw_data;
+  uint64_t rdata_start = image_base + rdata_sec->virtual_address;
+  uint64_t rdata_end = rdata_start + rdata_sec->virtual_size;
+
+  if (a->start_off >= raw_size) {
     return 0;
   }
+  if (a->end_off > raw_size) {
+    a->end_off = raw_size;
+  }
 
-  UINT64 searchStart = markerFunctionRVA - textSection.virtualAddress;
-
-  for (DWORD i = searchStart + 100; i < searchStart + 5000 && i < textSection.rawSize - 2000; i++) {
-    BYTE* code = textSection.data + i;
-
-    if (!(code[0] == 0x48 && code[1] == 0x83 && code[2] == 0xEC && code[3] == 0x38)) {
+  for (uint32_t i = a->start_off; i + FUNC_MIN_SIZE < a->end_off; ++i) {
+    uint8_t *code = base + i;
+    if (!(code[0] == OPCODE_SUB_RSP_38_0 && code[1] == OPCODE_SUB_RSP_38_1 &&
+          code[2] == OPCODE_SUB_RSP_38_2 && code[3] == OPCODE_SUB_RSP_38_3)) {
       continue;
     }
 
-    UINT64 stringFunctionRVA = textSection.virtualAddress + i;
+    char strings[MAX_STRINGS_ARRAY][MAX_STRING_LEN];
+    uint64_t string_rvas[MAX_STRINGS_ARRAY];
+    size_t scount = 0;
 
-    char   strings[50][512] = {0};
-    UINT64 stringRVAs[50]   = {0};
-    int    stringCount      = 0;
-
-    for (DWORD j = i; j < i + 2000 && j < textSection.rawSize - 7; j++) {
-      BYTE* instr = textSection.data + j;
-
-      if (instr[0] == 0x48 && instr[1] == 0x8D && instr[2] == 0x15) {
-        INT32  disp     = *(INT32*)(instr + 3);
-        UINT64 instrRVA = textSection.virtualAddress + j;
-        UINT64 targetVA = imageBase + instrRVA + 7 + disp;
-
-        if (targetVA >= rdataStart && targetVA < rdataEnd) {
-          UINT64 targetRVA = targetVA - imageBase;
-
-          int isMarker = 0;
-          for (int k = 0; k < dataEntryCount; k++) {
-            if (targetRVA == dataEntries[k].rdataRVA) {
-              isMarker = 1;
-              break;
+    for (uint32_t j = i; j < i + SCAN_DEPTH && j + LEA_INSTR_SIZE < raw_size; ++j) {
+      uint8_t *instr = base + j;
+      if (instr[0] == OPCODE_LEA_RDX_0 && instr[1] == OPCODE_LEA_RDX_1 && 
+          instr[2] == OPCODE_LEA_RDX_2) {
+        int32_t disp = *(int32_t*)(instr + DISP_OFFSET);
+        uint64_t instr_rva = (uint64_t)text_sec->virtual_address + j;
+        uint64_t target_va = image_base + instr_rva + LEA_FULL_SIZE + (uint64_t)disp;
+        if (target_va >= rdata_start && target_va < rdata_end) {
+          uint64_t target_rva = target_va - image_base;
+          bool is_marker = false;
+          mtx_lock(&entries_mtx);
+          {
+            for (size_t k = 0; k < data_entry_count; k++) {
+              if (data_entries[k].rdata_rva == target_rva) {
+                is_marker = true;
+                break;
+              }
             }
           }
-
-          if (!isMarker) {
-            UINT64 strFileOff = rvaToFileOffset(targetRVA, sections, numSections);
-            if (strFileOff > 0) {
-              char* str = (char*)(peData + strFileOff);
-              int   len = 0;
-              while (len < 500 && str[len] != '\0')
-                len++;
-
-              if (len > 0 && len < 500 && stringCount < 50) {
-                myStrCpy(strings[stringCount], str, 511);
-                stringRVAs[stringCount] = targetRVA;
-                stringCount++;
+          mtx_unlock(&entries_mtx);
+          if (!is_marker) {
+            uint64_t off = (uint64_t)rdata_sec->pointer_to_raw_data +
+                           (target_rva - rdata_sec->virtual_address);
+            if (off < pe_size) {
+              size_t len = 0;
+              while (len < MAX_STRING_LEN - 1 && off + len < pe_size && 
+                     pe_data[off + len]) {
+                ++len;
+              }
+              if (len > 0) {
+                if (scount < MAX_STRINGS_ARRAY) {
+                  memset(strings[scount], 0, MAX_STRING_LEN);
+                  memcpy(strings[scount], pe_data + off, len);
+                  string_rvas[scount] = target_rva;
+                  scount++;
+                } else {
+                  break;
+                }
               }
             }
           }
         }
       }
-
-      if (instr[0] == 0xC3)
+      if (instr[0] == OPCODE_RET) {
         break;
+      }
     }
 
-    if (stringCount >= 15) {
-      myPrint("[+] String function at 0x");
-      myPrintNum(stringFunctionRVA, 1);
-      myPrint(" (");
-      myPrintNum(stringCount, 0);
-      myPrint(" strings)\r\n");
-
-      myPrint("\r\n[*] Mapping (reverse order):\r\n");
-
-      int mapped   = 0;
-      int minCount = (dataEntryCount < stringCount) ? dataEntryCount : stringCount;
-
-      for (int k = 0; k < minCount; k++) {
-        int stringIndex = stringCount - 1 - k;
-
-        myStrCpy(dataEntries[k].encryptedString, strings[stringIndex], 511);
-        dataEntries[k].stringRVA = stringRVAs[stringIndex];
-        dataEntries[k].found     = 1;
-
-        decryptString(dataEntries[k].encryptedString, dataEntries[k].decryptedString, 511);
-
-        myPrint("    [");
-        if (k < 10)
-          myPrint("0");
-        myPrintNum(k, 0);
-        myPrint("] ");
-        myPrint(dataEntries[k].dataName);
-        myPrint(" <- \"");
-        myPrint(dataEntries[k].encryptedString);
-        myPrint("\"\r\n");
-        myPrint("                    -> \"");
-        myPrint(dataEntries[k].decryptedString);
-        myPrint("\"\r\n");
-
-        mapped++;
+    if (scount >= MIN_MARKERS_COUNT) {
+      mtx_lock(&entries_mtx);
+      {
+        size_t minc = data_entry_count < scount ? data_entry_count : scount;
+        for (size_t k = 0; k < minc; ++k) {
+          size_t si = scount - 1 - k;
+          if (!data_entries[k].found) {
+            size_t str_len = strlen(strings[si]);
+            if (str_len >= MAX_STRING_LEN) {
+              str_len = MAX_STRING_LEN - 1;
+            }
+            memcpy(data_entries[k].decrypted_string, strings[si], str_len);
+            data_entries[k].decrypted_string[str_len] = '\0';
+            data_entries[k].string_rva = string_rvas[si];
+            xor_decrypt_inplace(data_entries[k].decrypted_string, XOR_KEY);
+            data_entries[k].found = true;
+            a->mapped++;
+          }
+        }
       }
-
-      myPrint("\r\n[+] Mapped: ");
-      myPrintNum(mapped, 0);
-      myPrint("\r\n");
-      return mapped;
+      mtx_unlock(&entries_mtx);
+      break;
     }
   }
-
-  myPrint("[-] String function not found\r\n");
   return 0;
 }
 
-void
-printDictionary() {
-  myPrint("\r\n");
-  myPrint("================================================================================\r\n");
-  myPrint("                          DICTIONARY\r\n");
-  myPrint("================================================================================\r\n");
-  myPrint("Marker       | Encrypted                                | Decrypted\r\n");
-  myPrint("-------------|------------------------------------------|-------------------------------"
-          "-----------\r\n");
-
-  for (int i = 0; i < dataEntryCount; i++) {
-    if (dataEntries[i].found && dataEntries[i].encryptedString[0] != '\0') {
-      char enc[41] = {0};
-      char dec[41] = {0};
-      myStrCpy(enc, dataEntries[i].encryptedString, 40);
-      myStrCpy(dec, dataEntries[i].decryptedString, 40);
-
-      myPrint(dataEntries[i].dataName);
-      int padding = 12 - myStrLen(dataEntries[i].dataName);
-      for (int p = 0; p < padding; p++)
-        myPrint(" ");
-      myPrint(" | ");
-      myPrint(enc);
-      padding = 40 - myStrLen(enc);
-      for (int p = 0; p < padding; p++)
-        myPrint(" ");
-      myPrint(" | ");
-      myPrint(dec);
-      myPrint("\r\n");
-    }
+static int cmp_entries_by_rva(const void *pa, const void *pb) {
+  const data_entry_t *a = pa;
+  const data_entry_t *b = pb;
+  
+  if (a->rdata_rva < b->rdata_rva) {
+    return -1;
   }
 
-  myPrint("================================================================================\r\n");
-}
-
-void
-exportToJSON(const char* filename) {
-  HANDLE hFile =
-      CreateFileA(filename, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-  if (hFile == INVALID_HANDLE_VALUE)
-    return;
-
-  DWORD written;
-
-  WriteFile(hFile, "{\r\n", 3, &written, NULL);
-  WriteFile(hFile, "  \"image_base\": \"0x", 19, &written, NULL);
-
-  char numBuf[32];
-  wsprintfA(numBuf, "%llX", imageBase);
-  WriteFile(hFile, numBuf, lstrlenA(numBuf), &written, NULL);
-
-  WriteFile(hFile, "\",\r\n", 4, &written, NULL);
-  WriteFile(hFile, "  \"decryption_key\": \"0x05\",\r\n", 31, &written, NULL);
-  WriteFile(hFile, "  \"data_entries\": [\r\n", 23, &written, NULL);
-
-  int first = 1;
-  for (int i = 0; i < dataEntryCount; i++) {
-    if (dataEntries[i].found && dataEntries[i].encryptedString[0] != '\0') {
-      if (!first)
-        WriteFile(hFile, ",\r\n", 3, &written, NULL);
-      first = 0;
-
-      WriteFile(hFile, "    {\r\n", 7, &written, NULL);
-      WriteFile(hFile, "      \"marker\": \"", 18, &written, NULL);
-      WriteFile(hFile, dataEntries[i].dataName, myStrLen(dataEntries[i].dataName), &written, NULL);
-      WriteFile(hFile, "\",\r\n", 4, &written, NULL);
-
-      WriteFile(hFile, "      \"encrypted\": \"", 21, &written, NULL);
-      WriteFile(hFile, dataEntries[i].encryptedString, myStrLen(dataEntries[i].encryptedString),
-                &written, NULL);
-      WriteFile(hFile, "\",\r\n", 4, &written, NULL);
-
-      WriteFile(hFile, "      \"decrypted\": \"", 21, &written, NULL);
-      WriteFile(hFile, dataEntries[i].decryptedString, myStrLen(dataEntries[i].decryptedString),
-                &written, NULL);
-      WriteFile(hFile, "\",\r\n", 4, &written, NULL);
-
-      WriteFile(hFile, "      \"rdata_rva\": \"0x", 23, &written, NULL);
-      wsprintfA(numBuf, "%llX", dataEntries[i].rdataRVA);
-      WriteFile(hFile, numBuf, lstrlenA(numBuf), &written, NULL);
-      WriteFile(hFile, "\",\r\n", 4, &written, NULL);
-
-      WriteFile(hFile, "      \"string_rva\": \"0x", 24, &written, NULL);
-      wsprintfA(numBuf, "%llX", dataEntries[i].stringRVA);
-      WriteFile(hFile, numBuf, lstrlenA(numBuf), &written, NULL);
-      WriteFile(hFile, "\"\r\n", 3, &written, NULL);
-
-      WriteFile(hFile, "    }", 5, &written, NULL);
-    }
+  if (a->rdata_rva > b->rdata_rva) {
+    return 1;
   }
 
-  WriteFile(hFile, "\r\n  ]\r\n}\r\n", 10, &written, NULL);
-  CloseHandle(hFile);
-
-  myPrint("\r\n[+] Exported: ");
-  myPrint(filename);
-  myPrint("\r\n");
+  return 0;
 }
 
-void
-exportToCSV(const char* filename) {
-  HANDLE hFile =
-      CreateFileA(filename, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-  if (hFile == INVALID_HANDLE_VALUE)
-    return;
-
-  DWORD written;
-  WriteFile(hFile, "Marker,Encrypted,Decrypted,RDATA_RVA,STRING_RVA\r\n", 49, &written, NULL);
-
-  for (int i = 0; i < dataEntryCount; i++) {
-    if (dataEntries[i].found && dataEntries[i].encryptedString[0] != '\0') {
-      char line[2048];
-      wsprintfA(line, "\"%s\",\"%s\",\"%s\",0x%llX,0x%llX\r\n", dataEntries[i].dataName,
-                dataEntries[i].encryptedString, dataEntries[i].decryptedString,
-                dataEntries[i].rdataRVA, dataEntries[i].stringRVA);
-      WriteFile(hFile, line, lstrlenA(line), &written, NULL);
-    }
-  }
-
-  CloseHandle(hFile);
-
-  myPrint("[+] Exported: ");
-  myPrint(filename);
-  myPrint("\r\n");
-}
-
-int
-main(int argc, char* argv[]) {
-  hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-
+int main(int argc, char **argv) {
   if (argc < 2) {
-    myPrint("pexw - PE String Extractor\r\n");
-    myPrint("Usage: pexw.exe <PE_file> [output.json] [output.csv]\r\n");
+    fprintf(stderr, "Usage: %s <PEfile> [threads]\n", argv[0]);
     return 1;
   }
 
-  const char* inputFile  = argv[1];
-  const char* jsonOutput = argc > 2 ? argv[2] : "dictionary.json";
-  const char* csvOutput  = argc > 3 ? argv[3] : "strings.csv";
+  int32_t nthreads = 0;
 
-  myPrint("================================================================================\r\n");
-  myPrint("                            pexw v1.0\r\n");
-  myPrint(
-      "================================================================================\r\n\r\n");
+  if (argc >= 3) {
+    nthreads = atoi(argv[2]);
+  }
 
-  myPrint("[*] Target: ");
-  myPrint(inputFile);
-  myPrint("\r\n");
+  if (nthreads <= 0) {
+    nthreads = get_cpu_count();
+  }
 
-  MappedFile mf;
-  if (!mapPEFile(inputFile, &mf)) {
+  const char *fname = argv[1];
+  struct stat st;
+
+  if (stat(fname, &st) != 0) {
+    perror("stat");
     return 1;
   }
 
-  myPrint("[+] Size: ");
-  myPrintNum(mf.fileSize, 0);
-  myPrint(" bytes\r\n");
-  myPrint("[+] Mapped at: 0x");
-  myPrintNum((UINT64)mf.pView, 1);
-  myPrint("\r\n");
+  pe_size = (size_t)st.st_size;
+  pe_data = malloc(pe_size);
 
-  SECTION_HEADER* sections    = NULL;
-  int             numSections = 0;
-
-  if (!parsePEHeaders(mf.pView, mf.fileSize, &sections, &numSections)) {
-    unmapPEFile(&mf);
+  if (!pe_data) {
+    perror("malloc");
     return 1;
   }
 
-  if (!loadSections(mf.pView, mf.fileSize, sections, numSections)) {
-    unmapPEFile(&mf);
+  FILE *f = fopen(fname, "rb");
+
+  if (!f) {
+    perror("fopen");
+    free(pe_data);
     return 1;
   }
 
-  if (!findDataMarkers()) {
-    unmapPEFile(&mf);
+  if (fread(pe_data, 1, pe_size, f) != pe_size) {
+    perror("fread");
+    fclose(f);
+    free(pe_data);
     return 1;
   }
 
-  extractStringsFromPairedFunctions(mf.pView, sections, numSections);
+  fclose(f);
 
-  printDictionary();
-  exportToJSON(jsonOutput);
-  exportToCSV(csvOutput);
+  if (pe_size < sizeof(dos_header_t)) {
+    fprintf(stderr, "file too small\n");
+    free(pe_data);
+    return 1;
+  }
 
-  if (dataEntries)
-    HeapFree(GetProcessHeap(), 0, dataEntries);
+  dos_header_t *dh = (dos_header_t*)pe_data;
 
-  unmapPEFile(&mf);
+  if (dh->e_magic != DOS_SIGNATURE) {
+    fprintf(stderr, "invalid DOS\n");
+    free(pe_data);
+    return 1;
+  }
 
-  myPrint("\r\n[+] Complete\r\n");
-  myPrint("================================================================================\r\n");
+  uint32_t peoff = dh->e_lfanew;
 
+  if (peoff + sizeof(uint32_t) + sizeof(file_header_t) > pe_size) {
+    fprintf(stderr, "truncated\n");
+    free(pe_data);
+    return 1;
+  }
+  uint32_t sig = *(uint32_t*)(pe_data + peoff);
+
+  if (sig != PE_SIGNATURE) {
+    fprintf(stderr, "invalid PE\n");
+    free(pe_data);
+    return 1;
+  }
+
+  file_header_t *fh = (file_header_t*)(pe_data + peoff + sizeof(uint32_t));
+  nt_headers64_t *nth = (nt_headers64_t*)(pe_data + peoff);
+
+  if (fh->machine != MACHINE_AMD64) {
+    fprintf(stderr, "only x64 supported\n");
+    free(pe_data);
+    return 1;
+  }
+
+  if (nth->optional_header.magic != OPT_MAGIC64) {
+    fprintf(stderr, "invalid optional header\n");
+    free(pe_data);
+    return 1;
+  }
+
+  image_base = nth->optional_header.image_base;
+  sections = (section_header_t*)((uint8_t*)&nth->optional_header +
+                                           fh->size_of_optional_header);
+  num_sections = fh->number_of_sections;
+  for (int32_t i = 0; i < num_sections; i++) {
+    char name[SECTION_NAME_LEN + 1];
+    memcpy(name, sections[i].name, SECTION_NAME_LEN);
+    name[SECTION_NAME_LEN] = 0;
+
+    if (strcmp(name, ".text") == 0) {
+      text_sec = &sections[i];
+    }
+
+    if (strcmp(name, ".rdata") == 0) {
+      rdata_sec = &sections[i];
+    }
+  }
+  if (!text_sec || !rdata_sec) {
+    fprintf(stderr, ".text or .rdata not found\n");
+    free(pe_data);
+    return 1;
+  }
+
+  timer_t timer;
+  timer_init(&timer);
+
+  mtx_init(&entries_mtx, mtx_plain);
+
+  thrd_t *tids = calloc((size_t)nthreads, sizeof(thrd_t));
+  rdata_arg_t *rargs = calloc((size_t)nthreads, sizeof(rdata_arg_t));
+  uint32_t raw_size = rdata_sec->size_of_raw_data;
+  uint32_t chunk = (raw_size + (uint32_t)nthreads - 1) / (uint32_t)nthreads;
+  for (int32_t i = 0; i < nthreads; i++) {
+    rargs[i].start_off = (uint32_t)i * chunk;
+    rargs[i].end_off = (uint32_t)(i + 1) * chunk;
+    thrd_create(&tids[i], rdata_worker, &rargs[i]);
+  }
+  for (int32_t i = 0; i < nthreads; i++) {
+    thrd_join(tids[i], NULL);
+  }
+  free(rargs);
+
+  mtx_lock(&entries_mtx);
+  {
+    if (data_entry_count > 1) {
+      qsort(data_entries, data_entry_count, sizeof(data_entry_t), cmp_entries_by_rva);
+    }
+  }
+
+  mtx_unlock(&entries_mtx);
+
+  text_arg_t *targs = calloc((size_t) nthreads, sizeof(text_arg_t));
+  uint32_t text_raw = text_sec->size_of_raw_data;
+  uint32_t tchunk = (text_raw + (uint32_t) nthreads - 1) / (uint32_t) nthreads;
+
+  for (int32_t i = 0; i < nthreads; i++) {
+    targs[i].start_off = (uint32_t)i * tchunk;
+    targs[i].end_off = (uint32_t)(i + 1) * tchunk;
+    thrd_create(&tids[i], marker_worker, &targs[i]);
+  }
+
+  for (int32_t i = 0; i < nthreads; i++) {
+    thrd_join(tids[i], NULL);
+  }
+
+  free(targs);
+
+  string_arg_t *sargs = calloc((size_t)nthreads, sizeof(string_arg_t));
+
+  for (int32_t i = 0; i < nthreads; i++) {
+    sargs[i].start_off = (uint32_t)i * tchunk;
+    sargs[i].end_off = (uint32_t)(i + 1) * tchunk;
+    sargs[i].mapped = 0;
+    thrd_create(&tids[i], string_worker, &sargs[i]);
+  }
+  for (int32_t i = 0; i < nthreads; i++) {
+    thrd_join(tids[i], NULL);
+  }
+
+  double elapsed = timer_elapsed(&timer);
+  fprintf(stderr, "Elapsed: %.4f s (threads=%" PRId32 ")\n", elapsed, nthreads);
+
+  for (size_t i = 0; i < data_entry_count; i++) {
+    if (data_entries[i].found) {
+      printf("%s: %s\n", data_entries[i].data_name, data_entries[i].decrypted_string);
+    }
+  }
+
+  free(tids);
+  free(sargs);
+
+  if (data_entries) {
+    free(data_entries);
+  }
+
+  if (pe_data) {
+    free(pe_data);
+  }
+
+  mtx_destroy(&entries_mtx);
   return 0;
 }
