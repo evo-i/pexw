@@ -240,9 +240,9 @@ static int32_t get_cpu_count(void) {
 #endif
 }
 
-static void xor05_decrypt_inplace(char *s) {
+static void xor_decrypt_inplace(char *s, char byte) {
   for (size_t i = 0; s[i]; ++i) {
-    s[i] = (char)(s[i] ^ XOR_KEY);
+    s[i] = (char)(s[i] ^ byte);
   }
 }
 
@@ -476,7 +476,7 @@ static int string_worker(void *arg) {
             memcpy(data_entries[k].decrypted_string, strings[si], str_len);
             data_entries[k].decrypted_string[str_len] = '\0';
             data_entries[k].string_rva = string_rvas[si];
-            xor05_decrypt_inplace(data_entries[k].decrypted_string);
+            xor_decrypt_inplace(data_entries[k].decrypted_string, XOR_KEY);
             data_entries[k].found = true;
             a->mapped++;
           }
@@ -505,7 +505,6 @@ static int cmp_entries_by_data_number(const void *pa, const void *pb) {
   const data_entry_t *a = pa;
   const data_entry_t *b = pb;
   
-  // Extract numbers from "dataXX" format
   int num_a = -1, num_b = -1;
   
   if (strncmp(a->data_name, "data", 4) == 0) {
@@ -516,25 +515,27 @@ static int cmp_entries_by_data_number(const void *pa, const void *pb) {
     num_b = atoi(b->data_name + 4);
   }
   
-  // If both have valid numbers, sort by number
   if (num_a >= 0 && num_b >= 0) {
     return num_a - num_b;
   }
-  
-  // If only one has valid number, it comes first
+
   if (num_a >= 0) return -1;
   if (num_b >= 0) return 1;
   
-  // If neither has valid number, sort by string
   return strcmp(a->data_name, b->data_name);
+}
+
+static void help(void) {
+  printf("PE XOR String Extractor\n");
+  printf("Usage: pexw <PEfile> [threads] [--no-sort]\n");
+  printf("  <PEfile>    - Path to PE file (DLL/EXE)\n");
+  printf("  [threads]   - Number of threads (default: CPU count)\n");
+  printf("  [--no-sort] - Disable sorting by data number (keep RVA order)\n");
 }
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    fprintf(stderr, "Usage: %s <PEfile> [threads] [--no-sort]\n", argv[0]);
-    fprintf(stderr, "  <PEfile>    - Path to PE file (DLL/EXE)\n");
-    fprintf(stderr, "  [threads]   - Number of threads (default: CPU count)\n");
-    fprintf(stderr, "  [--no-sort] - Disable sorting by data number (keep RVA order)\n");
+    help();
     return 1;
   }
 
@@ -542,12 +543,10 @@ int main(int argc, char **argv) {
   int32_t nthreads = 0;
   const char *fname = argv[1];
 
-  // Parse arguments
   for (int i = 2; i < argc; i++) {
     if (strcmp(argv[i], "--no-sort") == 0) {
       no_sort = true;
     } else {
-      // Try to parse as thread count
       int threads_arg = atoi(argv[i]);
       if (threads_arg > 0) {
         nthreads = threads_arg;
@@ -693,7 +692,6 @@ int main(int argc, char **argv) {
   double elapsed = timer_get_elapsed(&timer);
   fprintf(stderr, "Elapsed: %.4f s (threads=%" PRId32 ")\n", elapsed, nthreads);
 
-  // Sort by data number for output (unless --no-sort is specified)
   if (data_entry_count > 1 && !no_sort) {
     qsort(data_entries, data_entry_count, sizeof(data_entry_t), cmp_entries_by_data_number);
   }
