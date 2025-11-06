@@ -11,53 +11,42 @@
 
 #if defined(_WIN32) || defined(_WIN64)
   #include <windows.h>
-
   #define ATOMIC_VAR_INIT(x) {x}
-
   typedef struct { volatile uint64_t val; } atomic_uint_fast64_t;
-
   static inline uint64_t atomic_load(atomic_uint_fast64_t *obj) {
     return InterlockedOr64((volatile LONG64*)&obj->val, 0);
   }
-
   static inline bool atomic_compare_exchange_strong(atomic_uint_fast64_t *obj, uint64_t *expected, uint64_t desired) {
     uint64_t old = InterlockedCompareExchange64((volatile LONG64*)&obj->val, desired, *expected);
     if (old == *expected) return true;
     *expected = old;
     return false;
   }
-
   typedef struct {
     LARGE_INTEGER start;
     LARGE_INTEGER freq;
-  } timer_t;
-
-  static inline void timer_init(timer_t *t) {
+  } high_res_timer_t;
+  static inline void timer_start(high_res_timer_t *t) {
     QueryPerformanceFrequency(&t->freq);
     QueryPerformanceCounter(&t->start);
   }
-
-  static inline double timer_elapsed(timer_t *t) {
+  static inline double timer_get_elapsed(high_res_timer_t *t) {
     LARGE_INTEGER end;
     QueryPerformanceCounter(&end);
     return (double)(end.QuadPart - t->start.QuadPart) / (double)t->freq.QuadPart;
   }
-
 #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
   #include <sys/types.h>
   #include <sys/sysctl.h>
   #include <stdatomic.h>
   #include <time.h>
-
   typedef struct {
     struct timespec start;
-  } timer_t;
-
-  static inline void timer_init(timer_t *t) {
+  } high_res_timer_t;
+  static inline void timer_start(high_res_timer_t *t) {
     clock_gettime(CLOCK_MONOTONIC, &t->start);
   }
-
-  static inline double timer_elapsed(timer_t *t) {
+  static inline double timer_get_elapsed(high_res_timer_t *t) {
     struct timespec end;
     clock_gettime(CLOCK_MONOTONIC, &end);
     return (end.tv_sec - t->start.tv_sec) + (end.tv_nsec - t->start.tv_nsec) / 1e9;
@@ -66,21 +55,17 @@
   #include <unistd.h>
   #include <stdatomic.h>
   #include <time.h>
-
   typedef struct {
     struct timespec start;
-  } timer_t;
-
-  static inline void timer_init(timer_t *t) {
+  } high_res_timer_t;
+  static inline void timer_start(high_res_timer_t *t) {
     clock_gettime(CLOCK_MONOTONIC, &t->start);
   }
-
-  static inline double timer_elapsed(timer_t *t) {
+  static inline double timer_get_elapsed(high_res_timer_t *t) {
     struct timespec end;
     clock_gettime(CLOCK_MONOTONIC, &end);
     return (end.tv_sec - t->start.tv_sec) + (end.tv_nsec - t->start.tv_nsec) / 1e9;
   }
-
 #endif
 
 #define DOS_SIGNATURE       0x5A4D
@@ -239,7 +224,7 @@ static int32_t get_cpu_count(void) {
 #if defined(_WIN32) || defined(_WIN64)
   SYSTEM_INFO sysinfo;
   GetSystemInfo(&sysinfo);
-  return (int32_t) sysinfo.dwNumberOfProcessors;
+  return (int32_t)sysinfo.dwNumberOfProcessors;
 #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
   int32_t count;
   size_t count_len = sizeof(count);
@@ -249,15 +234,15 @@ static int32_t get_cpu_count(void) {
   return DEFAULT_CPU_COUNT;
 #elif defined(_SC_NPROCESSORS_ONLN)
   long procs = sysconf(_SC_NPROCESSORS_ONLN);
-  return (procs > 0) ? (int32_t) procs : DEFAULT_CPU_COUNT;
+  return (procs > 0) ? (int32_t)procs : DEFAULT_CPU_COUNT;
 #else
   return DEFAULT_CPU_COUNT;
 #endif
 }
 
-static void xor_decrypt_inplace(char *s, char byte) {
+static void xor05_decrypt_inplace(char *s) {
   for (size_t i = 0; s[i]; ++i) {
-    s[i] = (char)(s[i] ^ byte);
+    s[i] = (char)(s[i] ^ XOR_KEY);
   }
 }
 
@@ -491,7 +476,7 @@ static int string_worker(void *arg) {
             memcpy(data_entries[k].decrypted_string, strings[si], str_len);
             data_entries[k].decrypted_string[str_len] = '\0';
             data_entries[k].string_rva = string_rvas[si];
-            xor_decrypt_inplace(data_entries[k].decrypted_string, XOR_KEY);
+            xor05_decrypt_inplace(data_entries[k].decrypted_string);
             data_entries[k].found = true;
             a->mapped++;
           }
@@ -507,15 +492,12 @@ static int string_worker(void *arg) {
 static int cmp_entries_by_rva(const void *pa, const void *pb) {
   const data_entry_t *a = pa;
   const data_entry_t *b = pb;
-  
   if (a->rdata_rva < b->rdata_rva) {
     return -1;
   }
-
   if (a->rdata_rva > b->rdata_rva) {
     return 1;
   }
-
   return 0;
 }
 
@@ -524,48 +506,38 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Usage: %s <PEfile> [threads]\n", argv[0]);
     return 1;
   }
-
   int32_t nthreads = 0;
-
   if (argc >= 3) {
     nthreads = atoi(argv[2]);
   }
-
   if (nthreads <= 0) {
     nthreads = get_cpu_count();
   }
 
   const char *fname = argv[1];
   struct stat st;
-
   if (stat(fname, &st) != 0) {
     perror("stat");
     return 1;
   }
-
   pe_size = (size_t)st.st_size;
   pe_data = malloc(pe_size);
-
   if (!pe_data) {
     perror("malloc");
     return 1;
   }
-
   FILE *f = fopen(fname, "rb");
-
   if (!f) {
     perror("fopen");
     free(pe_data);
     return 1;
   }
-
   if (fread(pe_data, 1, pe_size, f) != pe_size) {
     perror("fread");
     fclose(f);
     free(pe_data);
     return 1;
   }
-
   fclose(f);
 
   if (pe_size < sizeof(dos_header_t)) {
@@ -573,58 +545,47 @@ int main(int argc, char **argv) {
     free(pe_data);
     return 1;
   }
-
   dos_header_t *dh = (dos_header_t*)pe_data;
-
   if (dh->e_magic != DOS_SIGNATURE) {
     fprintf(stderr, "invalid DOS\n");
     free(pe_data);
     return 1;
   }
-
   uint32_t peoff = dh->e_lfanew;
-
   if (peoff + sizeof(uint32_t) + sizeof(file_header_t) > pe_size) {
     fprintf(stderr, "truncated\n");
     free(pe_data);
     return 1;
   }
   uint32_t sig = *(uint32_t*)(pe_data + peoff);
-
   if (sig != PE_SIGNATURE) {
     fprintf(stderr, "invalid PE\n");
     free(pe_data);
     return 1;
   }
-
   file_header_t *fh = (file_header_t*)(pe_data + peoff + sizeof(uint32_t));
   nt_headers64_t *nth = (nt_headers64_t*)(pe_data + peoff);
-
   if (fh->machine != MACHINE_AMD64) {
     fprintf(stderr, "only x64 supported\n");
     free(pe_data);
     return 1;
   }
-
   if (nth->optional_header.magic != OPT_MAGIC64) {
     fprintf(stderr, "invalid optional header\n");
     free(pe_data);
     return 1;
   }
-
   image_base = nth->optional_header.image_base;
   sections = (section_header_t*)((uint8_t*)&nth->optional_header +
-                                           fh->size_of_optional_header);
+                                 fh->size_of_optional_header);
   num_sections = fh->number_of_sections;
   for (int32_t i = 0; i < num_sections; i++) {
     char name[SECTION_NAME_LEN + 1];
     memcpy(name, sections[i].name, SECTION_NAME_LEN);
     name[SECTION_NAME_LEN] = 0;
-
     if (strcmp(name, ".text") == 0) {
       text_sec = &sections[i];
     }
-
     if (strcmp(name, ".rdata") == 0) {
       rdata_sec = &sections[i];
     }
@@ -635,8 +596,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  timer_t timer;
-  timer_init(&timer);
+  high_res_timer_t timer;
+  timer_start(&timer);
 
   mtx_init(&entries_mtx, mtx_plain);
 
@@ -660,27 +621,22 @@ int main(int argc, char **argv) {
       qsort(data_entries, data_entry_count, sizeof(data_entry_t), cmp_entries_by_rva);
     }
   }
-
   mtx_unlock(&entries_mtx);
 
-  text_arg_t *targs = calloc((size_t) nthreads, sizeof(text_arg_t));
+  text_arg_t *targs = calloc((size_t)nthreads, sizeof(text_arg_t));
   uint32_t text_raw = text_sec->size_of_raw_data;
-  uint32_t tchunk = (text_raw + (uint32_t) nthreads - 1) / (uint32_t) nthreads;
-
+  uint32_t tchunk = (text_raw + (uint32_t)nthreads - 1) / (uint32_t)nthreads;
   for (int32_t i = 0; i < nthreads; i++) {
     targs[i].start_off = (uint32_t)i * tchunk;
     targs[i].end_off = (uint32_t)(i + 1) * tchunk;
     thrd_create(&tids[i], marker_worker, &targs[i]);
   }
-
   for (int32_t i = 0; i < nthreads; i++) {
     thrd_join(tids[i], NULL);
   }
-
   free(targs);
 
   string_arg_t *sargs = calloc((size_t)nthreads, sizeof(string_arg_t));
-
   for (int32_t i = 0; i < nthreads; i++) {
     sargs[i].start_off = (uint32_t)i * tchunk;
     sargs[i].end_off = (uint32_t)(i + 1) * tchunk;
@@ -691,7 +647,7 @@ int main(int argc, char **argv) {
     thrd_join(tids[i], NULL);
   }
 
-  double elapsed = timer_elapsed(&timer);
+  double elapsed = timer_get_elapsed(&timer);
   fprintf(stderr, "Elapsed: %.4f s (threads=%" PRId32 ")\n", elapsed, nthreads);
 
   for (size_t i = 0; i < data_entry_count; i++) {
@@ -702,15 +658,12 @@ int main(int argc, char **argv) {
 
   free(tids);
   free(sargs);
-
   if (data_entries) {
     free(data_entries);
   }
-
   if (pe_data) {
     free(pe_data);
   }
-
   mtx_destroy(&entries_mtx);
   return 0;
 }
