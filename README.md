@@ -1,269 +1,227 @@
 # pexw - Cross-Platform PE String Extractor
 
-Кроссплатформенный инструмент для извлечения и расшифровки строк из PE файлов (DLL/EXE).
+A cross-platform tool for extracting and decrypting strings from PE files (DLL/EXE) with multi-threaded processing.
 
-## Особенности
+## Features
 
-- **Кроссплатформенность**: Windows, Linux, macOS
-- **Capstone дизассемблер**: Точный анализ машинного кода
-- **XOR дешифрование**: Автоматическое дешифрование с ключом 0x5
-- **Экспорт**: JSON и CSV форматы
+- **Cross-platform**: Windows, Linux, macOS, *BSD
+- **Multi-threaded**: Parallel processing with configurable thread count
+- **Native PE parsing**: Manual PE structure parsing without external dependencies
+- **XOR decryption**: Automatic decryption with key 0x5
+- **High-performance**: Atomic operations and lock-based synchronization
 
-## Версии
+## Architecture
 
-### expwds.c (Windows-only)
-- Использует WinAPI для работы с файлами
-- Ручной парсинг PE структур
-- Не требует внешних библиотек
+The tool uses a sophisticated multi-threaded approach:
+- **RData scanner threads**: Search for data markers in parallel
+- **Marker function finder**: Identifies functions containing only marker references
+- **String extraction threads**: Extract and decrypt strings in parallel
+- **Atomic synchronization**: Lock-free coordination between threads
 
-### expwds_cross.c (Cross-platform)
-- Работает на Windows, Linux, macOS
-- Использует Capstone для дизассемблирования
-- Универсальные POSIX API для файлов
+## Requirements
 
-## Установка зависимостей
+- C17 compiler (GCC, Clang, MSVC)
+- POSIX threads (pthread on Unix-like systems, native threads on Windows)
+- Standard C library
 
-### Windows (MSYS2/MinGW)
-```bash
-pacman -S mingw-w64-x86_64-capstone
-```
+No external dependencies required - all PE parsing and disassembly is done natively.
 
-### Windows (MSYS2/UCRT64)
-```bash
-pacman -S mingw-w64-ucrt-x86_64-capstone
-```
+## Building
 
-### Linux (Debian/Ubuntu)
-```bash
-sudo apt-get install libcapstone-dev
-```
-
-### Linux (Fedora/RHEL)
-```bash
-sudo dnf install capstone-devel
-```
-
-### macOS
-```bash
-brew install capstone
-```
-
-## Сборка
-
-### Сборка с помощью CMake (рекомендуется)
+### Using Meson (recommended)
 
 ```bash
-cd utils
-mkdir build
-cd build
+# Setup build directory
+meson setup builddir
 
-# Конфигурация
-cmake ..
+# Compile
+meson compile -C builddir
 
-# Компиляция
-cmake --build .
-
-# Установка (опционально)
-cmake --install .
+# Install (optional)
+meson install -C builddir
 ```
 
-### Сравнение систем сборки
+### Manual compilation
 
-| Функция | CMake | Meson |
-|---------|-------|-------|
-| Поиск зависимостей | ✅ | ✅ |
-| Кроссплатформенность | ✅ | ✅ |
-| Автоопределение компилятора | ✅ | ✅ |
-| Параллельная сборка | ✅ | ✅ |
-| Установка | ✅ | ✅ |
-| Синтаксис | CMakeLists.txt | meson.build |
-| Генератор | Ninja/Make | Ninja |
-| Скорость конфигурации | Средняя | Быстрая |
-
-## Использование
-
-#### Windows (MSYS2)
+#### Windows (MSYS2/MinGW)
 ```bash
-gcc expwds_cross.c -o expwds_cross -lcapstone -O2
+gcc -std=c17 -O2 -Wall -Wextra pexw.c -o pexw.exe
 ```
 
-#### Linux
+#### Linux/macOS/*BSD
 ```bash
-gcc expwds_cross.c -o expwds_cross -lcapstone -O2 -Wall
+gcc -std=c17 -O2 -Wall -Wextra -pthread pexw.c -o pexw
 ```
 
-#### macOS
-```bash
-gcc expwds_cross.c -o expwds_cross -lcapstone -O2 -Wall
-```
-
-### Windows-only версия (без Capstone)
-```bash
-gcc expwds.c -o expwds.exe -O2
-```
-
-## Использование
+## Usage
 
 ```bash
-# Базовое использование
-./expwds_cross SoulWorker64.dll
+# Basic usage with auto-detected CPU count
+./pexw sample.dll
 
-# С указанием выходных файлов
-./expwds_cross SoulWorker64.dll output.json output.csv
+# Specify custom thread count
+./pexw sample.dll 8
 
-# Windows версия
-./expwds.exe SoulWorker64.dll
+# Windows
+pexw.exe sample.dll 4
 ```
 
-## Выходные форматы
+### Parameters
+- `<PEfile>`: Path to the PE file (DLL or EXE)
+- `[threads]`: Optional thread count (defaults to CPU core count)
 
-### JSON (dictionary.json)
-```json
-{
-  "image_base": "0x180000000",
-  "decryption_key": "0x05",
-  "data_entries": [
-    {
-      "marker": "data88",
-      "encrypted": "F?YRjw...",
-      "decrypted": "C:\\Workspace...",
-      "rdata_rva": "0x3E400",
-      "string_rva": "0x42A10"
-    }
-  ]
-}
+## Output Format
+
+The tool outputs decrypted strings in the format:
+```
+data01: Decrypted string content
+data02: Another decrypted string
+...
 ```
 
-### CSV (strings.csv)
-```csv
-Marker,Encrypted,Decrypted,RDATA_RVA,STRING_RVA
-"data88","F?YRjw...","C:\\Workspace...",0x3E400,0x42A10
+Performance information is written to stderr:
+```
+Elapsed: 0.1234 s (threads=8)
 ```
 
-## Алгоритм работы
+## Algorithm Overview
 
-1. **Загрузка PE файла**: Memory mapping для эффективной работы
-2. **Парсинг заголовков**: DOS, NT, Optional Headers
-3. **Поиск секций**: .text (код) и .rdata (данные)
-4. **Поиск маркеров**: Сканирование dataXX паттернов
-5. **Дизассемблирование**: Анализ .text с помощью Capstone
-6. **Поиск функций**: 
-   - Функция инициализации маркеров
-   - Функция инициализации строк
-7. **Сопоставление**: Связывание маркеров со строками (reverse order)
-8. **Дешифрование**: XOR каждого байта с 0x5
-9. **Экспорт**: JSON и CSV
+1. **PE File Loading**: Memory-mapped file loading for efficiency
+2. **Header Parsing**: DOS, NT, and Optional Headers validation
+3. **Section Discovery**: Locate .text (code) and .rdata (data) sections
+4. **Parallel Marker Search**: Multi-threaded scanning for `dataXX` patterns in .rdata
+5. **Marker Function Discovery**: Find function containing only marker references using atomic coordination
+6. **String Extraction**: Multi-threaded extraction and XOR decryption (key: 0x5)
+7. **Output**: Display marker-string pairs sorted by RVA
 
-## Техническая информация
+## Technical Details
 
-### Структура PE файла
+### PE Structure Analysis
 ```
 DOS Header (MZ)
   └─> e_lfanew → NT Headers (PE)
                    ├─> File Header
                    └─> Optional Header64
                          └─> Sections
-                               ├─> .text (код)
-                               └─> .rdata (данные)
+                               ├─> .text (executable code)
+                               └─> .rdata (read-only data)
 ```
 
-### Поиск функций инициализации
+### Function Pattern Recognition
 
-**Паттерн пролога функции:**
+**Function Prologue Pattern:**
 ```asm
-push rbp          ; или
-sub rsp, 0x38     ; Выделение стека
+sub rsp, 0x38     ; 48 83 EC 38 - Stack allocation
 ```
 
-**Паттерн LEA для .rdata:**
+**LEA Instruction Pattern:**
 ```asm
-lea rdx, [rip + disp]  ; 48 8D 15 [disp]
+lea rdx, [rip + disp]  ; 48 8D 15 [disp] - RIP-relative addressing
 ```
 
-**Критерии функции маркеров:**
-- ≥15 LEA инструкций
-- Все ссылки на dataXX маркеры
-- Нет ссылок на другие строки
+**Marker Function Criteria:**
+- Contains ≥15 LEA instructions
+- All references point to dataXX markers
+- No references to other strings
+- Uses atomic synchronization for thread-safe discovery
 
-**Критерии функции строк:**
-- ≥15 LEA инструкций  
-- Все ссылки НЕ на маркеры
-- Находится после функции маркеров
+**String Function Criteria:**
+- Contains ≥15 LEA instructions  
+- All references point to non-marker strings
+- Found after processing all marker functions
 
-### XOR дешифрование
+### XOR Decryption
 ```c
-for (int i = 0; i < len; i++) {
-    decrypted[i] = encrypted[i] ^ 0x05;
+void xor_decrypt_inplace(char *s, char byte) {
+    for (size_t i = 0; s[i]; ++i) {
+        s[i] = (char)(s[i] ^ byte);
+    }
 }
 ```
 
-## Различия версий
+### Threading Architecture
 
-| Функция | expwds.c | expwds_cross.c |
-|---------|----------|----------------|
-| Windows | ✅ | ✅ |
-| Linux | ❌ | ✅ |
-| macOS | ❌ | ✅ |
-| WinAPI | ✅ | ❌ |
-| POSIX | ❌ | ✅ |
-| Capstone | ❌ | ✅ |
-| Зависимости | Нет | libcapstone |
-| Размер exe | ~50KB | ~100KB |
+The application uses a sophisticated threading model:
 
-## Примеры
+- **Thread-safe data structures**: Mutex-protected dynamic arrays
+- **Atomic coordination**: Lock-free marker function discovery
+- **Work distribution**: Even workload distribution across CPU cores
+- **Platform abstraction**: Windows threads vs POSIX threads
 
-### Анализ SoulWorker64.dll
+## Platform Support
+
+| Platform | Status | Threading | Timer |
+|----------|--------|-----------|-------|
+| Windows | ✅ | Native Windows threads | QueryPerformanceCounter |
+| Linux | ✅ | POSIX threads | clock_gettime |
+| macOS | ✅ | POSIX threads | clock_gettime |
+| FreeBSD | ✅ | POSIX threads | clock_gettime |
+| OpenBSD | ✅ | POSIX threads | clock_gettime |
+| NetBSD | ✅ | POSIX threads | clock_gettime |
+
+## Error Handling
+
+The tool validates all PE structures and provides clear error messages:
+
+- **"file too small"**: File smaller than DOS header
+- **"invalid DOS"**: Missing MZ signature
+- **"invalid PE"**: Missing PE signature  
+- **"only x64 supported"**: Not an AMD64 executable
+- **".text or .rdata not found"**: Required sections missing
+
+## Example Usage
+
+### Basic Analysis
 ```bash
-./expwds_cross 'F:\Games\SoulWorker\SoulWorker64.dll'
+./pexw sample.dll
 ```
 
-Вывод:
+Output:
 ```
-[+] DOS Header: 0x108
-[+] PE Signature found
-[+] Machine: 0x8664
-[+] Sections: 6
-[+] Image Base: 0x180000000
-[+] .text VA=0x1000 Size=0x2B5E9
-[+] .rdata VA=0x3E000 Size=0x1E7D0
-[+] Total: 21 markers
-[+] Marker function at 0x7A20 (21 markers)
-[+] String function at 0x7B60 (21 strings)
-[+] Mapped: 21
+data01: C:\Program Files\Application\config.ini
+data02: SELECT * FROM users WHERE id = ?
+data03: Error: Invalid configuration file
+...
+Elapsed: 0.0156 s (threads=8)
 ```
 
-### Анализ BaseDX11.dll
+### Performance Tuning
 ```bash
-./expwds_cross 'F:\Games\SoulWorker\BaseDX11.dll'
+# Use 16 threads for large files
+./pexw large_file.dll 16
+
+# Use single thread for debugging
+./pexw sample.dll 1
 ```
 
-## Устранение проблем
+## Troubleshooting
 
-### "Capstone library not found"
-- **Windows**: `pacman -S mingw-w64-x86_64-capstone`
-- **Linux**: `sudo apt-get install libcapstone-dev`
-- **macOS**: `brew install capstone`
+### Common Issues
 
-### "Invalid DOS signature"
-- Проверьте, что файл является PE (не упакован/защищен)
+**"Invalid DOS signature"**
+- Verify the file is a valid PE executable
+- Check if the file is packed or protected
 
-### "Required sections not found"
-- PE файл должен содержать .text и .rdata секции
+**"Required sections not found"**
+- PE file must contain both .text and .rdata sections
+- Some packed executables may have renamed sections
 
-### "Marker function not found"
-- Возможно другой паттерн инициализации
-- Попробуйте Windows версию (другая эвристика)
+**"No markers found"**
+- The executable might use a different string obfuscation method
+- Try different XOR keys (modify `XOR_KEY` constant)
 
-## Лицензия
+### Performance Tips
+
+- **Optimal thread count**: Usually matches CPU core count
+- **Large files**: Consider increasing `SCAN_DEPTH` for complex executables
+- **Memory usage**: Tool loads entire PE file into memory
+
+## License
 
 MIT License
 
-## Авторы
+## Technical References
 
-- Original Windows version
-- Cross-platform port with Capstone integration
-
-## См. также
-
-- [Capstone Engine](http://www.capstone-engine.org/)
 - [PE Format Specification](https://docs.microsoft.com/en-us/windows/win32/debug/pe-format)
+- [Intel x86-64 Instruction Set](https://software.intel.com/content/www/us/en/develop/articles/intel-sdm.html)
+- [POSIX Threads Programming](https://computing.llnl.gov/tutorials/pthreads/)
